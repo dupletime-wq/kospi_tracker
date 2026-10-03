@@ -30,7 +30,8 @@ def md(df: pd.DataFrame, fmt: dict[str, str] | None = None) -> str:
 
 
 def main() -> None:
-    targets, prices, errors = fetch_all()
+    mk = fetch_all()
+    targets, prices = mk.targets, mk.prices
     pure, _ = F.dram_pure(prices, ["MU", "WDC", "SNDK", "STX"], {k: targets[k] for k in ("SEC", "HYNIX")})
     cfg = P.Config(models=P.ALL_MODELS)
     keys = list(TARGETS)

@@ -57,9 +57,17 @@ div[data-testid="stMetric"] {{ background:#fff; border:1px solid #e9ecef; border
 )
 
 
+class MarketUnavailable(RuntimeError):
+    pass
+
+
 @st.cache_data(ttl=600, show_spinner="시장 데이터 불러오는 중…")
 def load_market():
-    return fetch_all()
+    mk = fetch_all()
+    if "KOSPI" not in mk.targets:
+        # 예외는 캐시되지 않는다 → 다음 접속/새로고침 때 다시 시도 (빈 결과를 캐시하면 10분간 같은 오류가 반복됨)
+        raise MarketUnavailable("; ".join(f"{k}: {v}" for k, v in mk.errors.items()) or "알 수 없는 오류")
+    return mk
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -89,11 +97,23 @@ def fmt_px(key: str, v: float) -> str:
     return f"{v:,.1f}" if key == "KOSPI" else f"{v:,.0f}원"
 
 
-targets, prices, errors = load_market()
-if "KOSPI" not in targets:
-    st.error("KOSPI 데이터를 불러오지 못했습니다. 잠시 후 새로고침해 주세요.")
+try:
+    mk = load_market()
+except MarketUnavailable as exc:
+    st.error("시장 데이터를 불러오지 못했습니다. Yahoo Finance가 일시적으로 요청을 제한했을 수 있습니다 (Streamlit Cloud 공유 IP에서 흔함).")
+    st.code(str(exc)[:1500])
+    if st.button("🔄 다시 시도"):
+        st.rerun()
     st.stop()
+targets, prices, errors, stale = mk.targets, mk.prices, mk.errors, mk.stale
 kospi = targets["KOSPI"]
+if stale:
+    when = stale.get("KOSPI", max(stale.values()))
+    age = (pd.Timestamp.today().normalize() - pd.Timestamp(when)).days
+    st.warning(
+        f"⚠️ 실시간 수집에 실패한 {len(stale)}개 종목은 저장된 스냅샷(최근 {when})으로 대체했습니다. "
+        + ("**데이터가 4일 이상 지나 예측이 현재 시장과 다를 수 있습니다.**" if age > 4 else "예측 기준일이 실제와 다를 수 있습니다.")
+        + " 잠시 후 '데이터 새로고침'을 눌러 보세요.")
 
 # ---------------- 사이드바 ----------------
 with st.sidebar:
@@ -142,8 +162,10 @@ with st.sidebar:
                       help="KOSPI 추정치와의 가중평균 비중(임의 설정, 학습 불가). 삼성전자·SK하이닉스에는 "
                            "KOSPI 갭 대비 베타만큼 같은 충격을 전달합니다.")
 
-for key, msg in errors.items():
-    st.sidebar.warning(f"{key}: 수집 실패 ({msg})")
+if errors:
+    with st.sidebar.expander(f"데이터 수집 경고 ({len(errors)})"):
+        for key, msg in errors.items():
+            st.caption(f"{key}: {'스냅샷 대체 — ' if key in stale else ''}{msg[:160]}")
 
 # ---------------- 분석 실행 ----------------
 us_peers = [p for p in peers_sel if not p.startswith("KR_")]
