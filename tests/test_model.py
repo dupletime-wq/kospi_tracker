@@ -2,7 +2,8 @@ import numpy as np
 import pandas as pd
 
 from src.data_sources import parse_night_futures
-from src.model import blend_with_futures, build_dataset, fit_model, next_kr_session, walk_forward
+from src.model import (blend_with_futures, build_dataset, dram_pure, fit_model, fit_staged, gap_beta,
+                       next_kr_session, walk_forward)
 
 
 def _market(n=300, seed=0):
@@ -53,3 +54,45 @@ def test_parse_night_futures():
     assert parse_night_futures("<div>아무것도 없음</div>") is None
     got = parse_night_futures('<span class="night-change">-0.45%</span>')
     assert got is not None and got.change_pct == -0.45
+
+
+def _ohlc(close):
+    return pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close})
+
+
+def test_dram_pure_removes_peer_effect():
+    rng = np.random.default_rng(1)
+    days = pd.bdate_range("2025-01-01", periods=150)
+    mu = rng.normal(0, 2, 150)
+    own = rng.normal(0, 1, 150)  # 순수 수급
+    dram = 0.8 * mu + own
+    mk = lambda r: _ohlc(pd.Series(100 * np.cumprod(1 + r / 100), index=days))
+    pure, info = dram_pure({"DRAM": mk(dram), "MU": mk(mu)}, ["MU"])
+    assert abs(info["betas"]["MU"] - 0.8) < 0.15
+    assert abs(np.corrcoef(pure.to_numpy(), own[1:])[0, 1]) > 0.9
+
+
+def test_dram_pure_insufficient_data_is_empty():
+    days = pd.bdate_range("2025-01-01", periods=20)
+    df = _ohlc(pd.Series(np.linspace(100, 110, 20), index=days))
+    pure, info = dram_pure({"DRAM": df, "MU": df}, ["MU"])
+    assert pure.empty and info == {}
+
+
+def test_staged_uses_short_history_extra():
+    kospi, prices = _market(n=300, seed=3)
+    extra = pd.Series(np.random.default_rng(4).normal(0, 1, 300),
+                      index=prices["EWY"].index).tail(100)  # 최근 100일만 존재
+    data = build_dataset(kospi, prices, ["EWY"], {"X": extra})
+    assert data["X"].notna().sum() > 80 and data["X"].isna().sum() > 100
+    fit = fit_staged(data, ["EWY"], ["X"], alpha=1.0)
+    assert fit.extra is not None and fit.keys == ["EWY", "X"]
+    assert fit_staged(data.head(150), ["EWY"], ["X"]).extra is None  # extra 표본 부족 -> 1단계만
+    assert np.isfinite(fit.predict(data.tail(5))).all()
+
+
+def test_gap_beta():
+    kospi, _ = _market()
+    stock = kospi.copy()
+    stock["Open"] = stock["Close"].shift(1) * (1 + 2 * (kospi["Open"] / kospi["Close"].shift(1) - 1))
+    assert abs(gap_beta(stock.dropna(), kospi) - 2.0) < 0.1

@@ -17,10 +17,23 @@ FEATURES: dict[str, tuple[str, str, bool]] = {
     "SOXX": ("SOXX", "SOXX (반도체 ETF)", True),
     "SMH": ("SMH", "SMH (반도체 ETF)", True),
     "MU": ("MU", "마이크론 (MU)", True),
-    # 2026-04 상장으로 이력이 짧아 기본 제외
-    "DRAM": ("DRAM", "DRAM ETF (메모리, 상장 6개월 내외)", False),
 }
 KOSPI_TICKER = "^KS11"
+# DRAM ETF (2026-04 상장, 이력 짧음): 모델의 2단계 지표로 쓰며, 구성종목 영향을 제거해 순수 수급 성분을 만든다.
+DRAM_TICKER = "DRAM"
+# DRAM에서 제거(분해)할 미국 상장 구성종목 후보: key -> (티커, 라벨)
+DRAM_PEERS: dict[str, tuple[str, str]] = {
+    "MU": ("MU", "마이크론"),
+    "WDC": ("WDC", "웨스턴디지털"),
+    "SNDK": ("SNDK", "샌디스크"),
+    "STX": ("STX", "씨게이트"),
+}
+# 예측 대상: key -> (티커, 라벨)
+TARGETS: dict[str, tuple[str, str]] = {
+    "KOSPI": (KOSPI_TICKER, "KOSPI"),
+    "SEC": ("005930.KS", "삼성전자"),
+    "HYNIX": ("000660.KS", "SK하이닉스"),
+}
 ESIGNAL_URL = "https://esignal.co.kr/kospi200-futures-night/"
 
 
@@ -38,21 +51,28 @@ def fetch_history(ticker: str, period: str = "5y") -> pd.DataFrame:
     return _clean(yf.Ticker(ticker).history(period=period, auto_adjust=True))
 
 
-def fetch_all(period: str = "5y") -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, str]]:
-    """(KOSPI 일봉, {지표키: 일봉}, {지표키: 오류메시지})."""
-    kospi = fetch_history(KOSPI_TICKER, period)
-    prices: dict[str, pd.DataFrame] = {}
+def fetch_all(period: str = "5y") -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], dict[str, str]]:
+    """({대상키: 일봉}, {지표키: 일봉(DRAM·구성종목 포함)}, {키: 오류메시지})."""
     errors: dict[str, str] = {}
-    for key, (ticker, _label, _default) in FEATURES.items():
+    targets: dict[str, pd.DataFrame] = {}
+    prices: dict[str, pd.DataFrame] = {}
+    jobs = (
+        [("t", k, t) for k, (t, _) in TARGETS.items()]
+        + [("p", k, t) for k, (t, _l, _d) in FEATURES.items()]
+        + [("p", "DRAM", DRAM_TICKER)]
+        + [("p", k, t) for k, (t, _) in DRAM_PEERS.items() if k not in FEATURES]
+    )
+    for kind, key, ticker in jobs:
         try:
             df = fetch_history(ticker, period)
-            if df.empty:
-                errors[key] = f"{ticker}: 데이터 없음"
-            else:
-                prices[key] = df
         except Exception as exc:  # 네트워크/비공식 API 오류는 앱을 죽이지 않는다
             errors[key] = f"{ticker}: {exc}"
-    return kospi, prices, errors
+            continue
+        if df.empty:
+            errors[key] = f"{ticker}: 데이터 없음"
+        else:
+            (targets if kind == "t" else prices)[key] = df
+    return targets, prices, errors
 
 
 @dataclass

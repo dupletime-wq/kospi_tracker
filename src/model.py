@@ -19,19 +19,55 @@ def pct_change(df: pd.DataFrame) -> pd.Series:
     return df["Close"].pct_change() * 100
 
 
-def build_dataset(kospi: pd.DataFrame, prices: dict[str, pd.DataFrame], keys: list[str]) -> pd.DataFrame:
-    """KOSPI 거래일 T마다 T 이전 최근 해외 거래일의 등락률을 붙인 학습표 (y 포함)."""
+def _attach(base: pd.DataFrame, key: str, ret: pd.Series) -> pd.DataFrame:
+    r = ret.dropna().rename(key).reset_index()
+    r.columns = ["date", key]
+    return pd.merge_asof(
+        base, r.sort_values("date"), on="date", direction="backward", allow_exact_matches=False,
+        tolerance=pd.Timedelta(days=5),
+    )
+
+
+def build_dataset(kospi: pd.DataFrame, prices: dict[str, pd.DataFrame], keys: list[str],
+                  extra: dict[str, pd.Series] | None = None) -> pd.DataFrame:
+    """대상 종목의 거래일 T마다 T 이전 최근 해외 거래일의 등락률을 붙인 학습표 (y 포함).
+
+    keys 는 결측이 없는 행만 남기고, extra(이력이 짧은 지표, 예: DRAM 순수 수급)는 결측을 허용한다."""
     base = pd.DataFrame({"date": kospi.index})
     base["y"] = (kospi["Open"] / kospi["Close"].shift(1) - 1).to_numpy() * 100
     base = base.dropna().sort_values("date")
     for key in keys:
-        ret = pct_change(prices[key]).dropna().rename(key).reset_index()
-        ret.columns = ["date", key]
-        base = pd.merge_asof(
-            base, ret.sort_values("date"), on="date", direction="backward", allow_exact_matches=False,
-            tolerance=pd.Timedelta(days=5),
-        )
-    return base.dropna().reset_index(drop=True)
+        base = _attach(base, key, pct_change(prices[key]))
+    base = base.dropna()
+    for key, ret in (extra or {}).items():
+        base = _attach(base, key, ret)
+    return base.reset_index(drop=True)
+
+
+def dram_pure(prices: dict[str, pd.DataFrame], peers: list[str]) -> tuple[pd.Series, dict]:
+    """DRAM ETF 등락률에서 구성종목(peers) 등락률의 선형 영향을 제거한 '순수 수급' 성분.
+
+    반환: (잔차 시계열(%p), {"r2":..., "betas": {peer: beta}, "n":...}). 계산 불가면 빈 시계열."""
+    from sklearn.linear_model import LinearRegression
+
+    peers = [p for p in peers if p in prices]
+    if "DRAM" not in prices or not peers:
+        return pd.Series(dtype=float), {}
+    X = pd.concat({p: pct_change(prices[p]) for p in peers}, axis=1)
+    y = pct_change(prices["DRAM"]).rename("DRAM")
+    df = pd.concat([y, X], axis=1).dropna()
+    if len(df) < 40:
+        return pd.Series(dtype=float), {}
+    lr = LinearRegression().fit(df[peers], df["DRAM"])
+    resid = df["DRAM"] - lr.predict(df[peers])
+    return resid.rename("DRAM_PURE"), {
+        "r2": float(lr.score(df[peers], df["DRAM"])), "betas": dict(zip(peers, map(float, lr.coef_))),
+        "n": len(df),
+    }
+
+
+def latest_extra(extra: dict[str, pd.Series]) -> pd.Series:
+    return pd.Series({k: float(v.dropna().iloc[-1]) for k, v in extra.items() if v.notna().any()})
 
 
 def latest_features(prices: dict[str, pd.DataFrame], keys: list[str]) -> pd.Series:
@@ -69,6 +105,54 @@ def fit_model(data: pd.DataFrame, keys: list[str], alpha: float = 10.0) -> Fit:
 
 
 @dataclass
+class Staged:
+    """1단계: 이력이 긴 지표(base) / 2단계: 이력이 짧은 지표(extra, 예: DRAM 순수 수급)로 1단계 오차를 설명."""
+    base: Fit
+    extra: Fit | None
+
+    @property
+    def keys(self) -> list[str]:
+        return self.base.keys + (self.extra.keys if self.extra else [])
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        p = self.base.predict(X)
+        if self.extra is not None:
+            e = X[self.extra.keys]
+            ok = e.notna().all(axis=1).to_numpy()
+            p = p + np.where(ok, self.extra.predict(e.fillna(0.0)), 0.0)
+        return p
+
+    def coefficients(self) -> pd.Series:
+        c = self.base.coefficients()
+        return pd.concat([c, self.extra.coefficients()]) if self.extra else c
+
+    def intercept(self) -> float:
+        return float(self.base.model.intercept_ + (self.extra.model.intercept_ if self.extra else 0.0))
+
+
+def fit_staged(data: pd.DataFrame, keys: list[str], extra_keys: list[str] | None = None,
+               alpha: float = 10.0, min_extra: int = 30) -> Staged:
+    base = fit_model(data, keys, alpha)
+    extra = None
+    if extra_keys:
+        sub = data.dropna(subset=extra_keys)
+        if len(sub) >= min_extra:
+            resid = sub["y"] - base.predict(sub)
+            extra = fit_model(sub.assign(y=resid), extra_keys, alpha)
+    return Staged(base, extra)
+
+
+def gap_beta(target: pd.DataFrame, kospi: pd.DataFrame) -> float:
+    """대상 종목 시가 갭을 KOSPI 시가 갭에 회귀한 기울기(야간선물 충격 전달용)."""
+    g = lambda d: ((d["Open"] / d["Close"].shift(1) - 1) * 100).rename("g")
+    df = pd.concat([g(target), g(kospi)], axis=1, keys=["s", "k"], sort=True).dropna()
+    df = df.tail(750)
+    if len(df) < 60 or df["k"].var() == 0:
+        return 1.0
+    return float(np.clip(df["s"].cov(df["k"]) / df["k"].var(), 0.0, 3.0))
+
+
+@dataclass
 class Backtest:
     frame: pd.DataFrame  # date, actual, pred
     mae: float
@@ -79,7 +163,8 @@ class Backtest:
 
 
 def walk_forward(data: pd.DataFrame, keys: list[str], alpha: float = 10.0, test_days: int = 120,
-                 min_train: int = 60, refit_every: int = 10) -> Backtest | None:
+                 min_train: int = 60, refit_every: int = 10,
+                 extra_keys: list[str] | None = None) -> Backtest | None:
     """확장 윈도우 워크포워드(미래 데이터 누수 없음). 표본이 부족하면 None."""
     n = len(data)
     start = max(min_train, n - test_days)
@@ -89,7 +174,7 @@ def walk_forward(data: pd.DataFrame, keys: list[str], alpha: float = 10.0, test_
     fit = None
     for i in range(start, n):
         if fit is None or (i - start) % refit_every == 0:
-            fit = fit_model(data.iloc[:i], keys, alpha)
+            fit = fit_staged(data.iloc[:i], keys, extra_keys, alpha)
         preds[i] = fit.predict(data.iloc[[i]])[0]
     out = pd.DataFrame({"date": data["date"], "actual": data["y"], "pred": preds}).iloc[start:]
     err = out["actual"] - out["pred"]
