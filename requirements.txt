@@ -6,3 +6,5 @@ scikit-learn>=1.4
 requests>=2.31
 beautifulsoup4>=4.12
 plotly>=5.20
+threadpoolctl>=3.2
+lightgbm>=4.3

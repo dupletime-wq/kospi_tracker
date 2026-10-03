@@ -1,33 +1,61 @@
 # KOSPI · 삼성전자 · SK하이닉스 시가 추정기
 
-한국장 마감 이후 **EWY, Franklin FTSE Korea UCITS ETF(런던), USD/KRW, SOXX·SMH·MU(반도체), DRAM ETF, KOSPI 야간선물**의 움직임으로
-다음 거래일 **KOSPI, 삼성전자, SK하이닉스의 시가 갭(전일 종가 대비 %)** 을 추정하는 Streamlit 앱입니다. 투자 조언이 아닙니다.
+한국장 마감 이후 해외 세션의 움직임으로 다음 거래일 **KOSPI, 삼성전자, SK하이닉스의 시가 갭(전일 종가 대비 %)** 을 추정하는 Streamlit 앱입니다.
+여러 모델(Ridge·Lasso·ElasticNet·Huber·Random Forest·GBM·LightGBM·하이브리드·앙상블)을 같은 워크포워드 조건에서 비교합니다. 투자 조언이 아닙니다.
 
-**2단계 모델**: 이력이 긴 지표로 Ridge 회귀(1단계) → 상장 6개월 내외인 DRAM ETF는 MU·WDC·SNDK·STX 영향을 제거한 *순수 수급* 성분으로 1단계 오차를 설명(2단계).
+## 핵심 결과 (검증은 모두 미래 누수 없는 워크포워드, 최근 500거래일)
+상세 표는 [`docs/BENCHMARK.md`](docs/BENCHMARK.md), 재현은 `python scripts/benchmark.py`.
+
+| 대상 | 기준선 MAE | 최고 모델 MAE | 개선율 | 방향 적중 | 상관 |
+|---|---|---|---|---|---|
+| KOSPI | 1.03 | 0.66 (GBM) / 0.68 (하이브리드) | 약 35% | 77~78% | 0.71~0.73 |
+| 삼성전자 | 1.75 | 1.12 (하이브리드) | 약 36% | 72% | 0.77 |
+| SK하이닉스 | 2.41 | 1.56 (하이브리드) | 약 35% | 77% | 0.76 |
+
+초기 6개 지표 Ridge(개선율 약 17~25%) 대비 향상은 대부분 **feature 설계**에서 왔고, 모델 교체 효과는 작았습니다.
+
+### 무엇이 효과가 있었고 무엇이 없었나
+| 아이디어 | 결과 |
+|---|---|
+| **미국·런던 세션을 세션내(시가→종가)와 오버나이트로 분해** | 가장 큰 효과 (Ridge 개선율 약 +7%p). 일간 수익률에는 이미 알려진 한국 장중 움직임이 섞여 있고, 세션내 수익률만 한국 마감 후 정보이기 때문 |
+| **삼성전자 런던 GDR** (한국 마감 후 삼성전자 직접 가격) | 삼성전자에서 뚜렷한 개선 (+약 4%p), KOSPI·하이닉스는 소폭 |
+| 한국장 전일 수익률 등 자기 시장 래그, 원화환산·"한국장 제외 증분" | 작지만 일관된 개선 |
+| 유럽 지수 · 반도체 확장(NVDA·TSM…) · 미국 매크로 · 일본/중국/원자재 | 일관된 개선 없음 → 기본값 제외(사이드바에서 켤 수 있음) |
+| 변동성 가중(WLS), 이상값 윈저라이즈 | 개선 없음/악화 → 끔 |
+| 최근 데이터 가중(반감기 500일) | 소폭 개선 → 사용 |
+| 모델: 선형이 거의 최고, 트리 단독은 약함, **Ridge+LightGBM 잔차 하이브리드**가 가장 안정적 | 신호가 대부분 선형이고 표본이 작음 |
+| **DRAM ETF 순수 수급** | 요청에 따라 포함하지만, 현재 표본(상장 약 6개월)에서는 오차를 줄이지 못함. 앱의 'DRAM 수급' 탭에서 포함/제외 비교를 그대로 보여줌 |
+
+> 한국 보유종목(삼성전자·SK하이닉스)의 같은 날 수익률까지 제거해야 DRAM의 "순수" 성분이 됩니다. 미국 세션 수익률에는 이미 한국 종가에 반영된 한국 장중 움직임이 섞여 있기 때문입니다.
+> 모델 간 순위 차이는 대부분 통계적으로 유의하지 않습니다. 최상위 모델을 고르는 것 자체가 낙관 편향을 만듭니다.
 
 ## 구성
 | 파일 | 역할 |
 |---|---|
-| `app.py` | Streamlit 한국어 UI |
-| `src/data_sources.py` | yfinance 가격 수집, esignal 야간선물 자동 수집 시도 |
-| `src/model.py` | 데이터 정렬(미래 데이터 누수 방지), Ridge 학습, 워크포워드 백테스트 |
-| `tests/` | 모델·파서 단위 테스트 (`pip install -r requirements-dev.txt && pytest`) |
+| `app.py` | Streamlit 한국어 UI (예측 카드, 근거 분해, 모델 비교, feature ablation, DRAM 분석) |
+| `src/data_sources.py` | yfinance 병렬 수집, esignal 야간선물 자동 수집 시도 |
+| `src/features.py` | 시점 정렬된 feature 생성(누수 방지), 세션내/오버나이트 분해, DRAM 순수 수급 |
+| `src/models.py` | 모델 동물원, 워크포워드, 지표(MAE·방향·상관·Newey-West t) |
+| `src/pipeline.py` | 분석 파이프라인, 예측 구간(변동성 정규화)·상승확률, 기여도(Ridge/SHAP), ablation |
+| `scripts/benchmark.py` | 전체 벤치마크 재현 |
+| `tests/` | 시점 정렬·워크포워드 불변성·모델·파이프라인 단위 테스트 (`pip install -r requirements-dev.txt && pytest`) |
 
 ## 로컬 실행
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
+최초 로드 약 25초(빠른 모델 구성), 사이드바에서 '전체 모델 비교'를 켜면 약 1.5분. 결과는 캐시됩니다.
 
 ## streamlit.app(Community Cloud) 배포
-이 저장소는 배포용 설정(`requirements.txt`, `runtime.txt`, `.streamlit/config.toml`)을 갖춘 상태입니다. 앱 생성은 본인 계정 로그인이 필요합니다.
-1. https://share.streamlit.io 에 GitHub 계정으로 로그인하고, 저장소(`dupletime-wq/kospi_tracker`) 접근을 허용합니다.
-2. **Create app → Deploy a public app from GitHub** 선택.
-3. Repository: `dupletime-wq/kospi_tracker`, Branch: 배포할 브랜치(PR 병합 후 `main` 권장), Main file path: `app.py`.
-4. Deploy. 배포 후 코드를 push하면 자동 반영됩니다.
+앱 생성은 본인 계정 로그인이 필요합니다.
+1. https://share.streamlit.io 에 GitHub 계정으로 로그인하고 저장소(`dupletime-wq/kospi_tracker`) 접근을 허용합니다.
+2. **Create app → Deploy a public app from GitHub**.
+3. Repository `dupletime-wq/kospi_tracker`, Branch 배포할 브랜치, Main file path `app.py`.
+4. Deploy. Community Cloud는 CPU가 약해 최초 로드가 로컬보다 느릴 수 있습니다.
 
 ## 데이터와 한계
-- **DRAM ETF**는 2026-04 상장이라 이력이 약 6개월(약 120거래일)입니다. 그래서 2단계로 반영하며, 'DRAM 수급 분석' 탭에서 DRAM 포함/제외 백테스트와 t값을 그대로 보여줍니다. 현재 표본에서는 순수 수급 성분의 설명력이 통계적으로 유의하지 않습니다(표본이 쌓이면 달라질 수 있음).
-- **야간선물(esignal.co.kr)**: 실시간 값이 웹소켓(세션 티켓 인증)으로 전달돼 자동 수집이 보통 실패합니다. 인증 우회는 하지 않으며, 실패하면 사이드바에 **수동 입력**합니다. 이력이 없어 학습에는 쓰지 않고 KOSPI 추정치와 가중평균(비중은 사용자가 지정)으로만 반영하고, 삼성전자·SK하이닉스에는 KOSPI 갭 대비 베타만큼 같은 충격을 전달합니다.
-- 환율(`KRW=X`)은 24시간 호가라 한국 마감 시점과 정확히 맞지 않는 근사입니다.
-- 한국 공휴일은 반영하지 않습니다. yfinance는 비공식 API라 지연·누락이 있을 수 있습니다.
+- **야간선물(esignal.co.kr)**: 실시간 값이 웹소켓(세션 티켓 인증)으로 전달돼 자동 수집이 보통 실패합니다. 인증 우회는 하지 않으며 실패하면 사이드바에 **수동 입력**합니다. 이력이 없어 학습에는 쓰지 못하고 KOSPI 추정치와의 가중평균(비중은 임의 지정)으로만 반영하며, 개별주에는 KOSPI 갭 베타만큼 전달합니다.
+- SK하이닉스 ADR(`SKHY`)은 상장 약 60거래일이라 학습에 쓰지 않았습니다. 이력이 쌓이면 삼성전자 GDR처럼 유효한 feature가 될 수 있습니다.
+- 환율(`KRW=X`)은 24시간 호가라 한국 마감 시점과 정확히 맞지 않는 근사입니다. 한국 공휴일은 반영하지 않습니다.
+- yfinance는 비공식 API라 지연·누락이 있을 수 있습니다.

@@ -9,32 +9,30 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-# key -> (yfinance 티커, 한글 라벨, 기본 학습 포함 여부)
-FEATURES: dict[str, tuple[str, str, bool]] = {
-    "EWY": ("EWY", "EWY (미국상장 한국 ETF)", True),
-    "FLXK": ("FLXK.L", "Franklin FTSE Korea UCITS (런던)", True),
-    "USDKRW": ("KRW=X", "USD/KRW 환율", True),
-    "SOXX": ("SOXX", "SOXX (반도체 ETF)", True),
-    "SMH": ("SMH", "SMH (반도체 ETF)", True),
-    "MU": ("MU", "마이크론 (MU)", True),
+# 예측 대상: key -> (티커, 라벨)
+TARGETS: dict[str, tuple[str, str]] = {
+    "KOSPI": ("^KS11", "KOSPI"),
+    "SEC": ("005930.KS", "삼성전자"),
+    "HYNIX": ("000660.KS", "SK하이닉스"),
 }
-KOSPI_TICKER = "^KS11"
-# DRAM ETF (2026-04 상장, 이력 짧음): 모델의 2단계 지표로 쓰며, 구성종목 영향을 제거해 순수 수급 성분을 만든다.
+# 모델 지표 풀: key -> 티커. 그룹은 src.features.GROUPS 와 대응한다.
+ASSETS: dict[str, str] = {
+    "EWY": "EWY", "FLXK": "FLXK.L", "USDKRW": "KRW=X", "SOXX": "SOXX", "SMH": "SMH", "MU": "MU",
+    "NVDA": "NVDA", "TSM": "TSM", "AMAT": "AMAT", "WDC": "WDC", "STX": "STX",
+    "SPY": "SPY", "QQQ": "QQQ", "VIX": "^VIX", "TNX": "^TNX", "DXY": "DX-Y.NYB", "EEM": "EEM",
+    "EWJ": "EWJ", "FXI": "FXI", "WTI": "CL=F", "GOLD": "GC=F",
+    "DAX": "^GDAXI", "SX5E": "^STOXX50E", "FTSE": "^FTSE", "SMSN": "SMSN.IL",
+}
+# DRAM ETF (2026-04 상장, 이력 짧음) 와, 순수 수급 성분을 만들기 위해 제거할 구성종목
 DRAM_TICKER = "DRAM"
-# DRAM에서 제거(분해)할 미국 상장 구성종목 후보: key -> (티커, 라벨)
 DRAM_PEERS: dict[str, tuple[str, str]] = {
     "MU": ("MU", "마이크론"),
     "WDC": ("WDC", "웨스턴디지털"),
     "SNDK": ("SNDK", "샌디스크"),
     "STX": ("STX", "씨게이트"),
 }
-# 예측 대상: key -> (티커, 라벨)
-TARGETS: dict[str, tuple[str, str]] = {
-    "KOSPI": (KOSPI_TICKER, "KOSPI"),
-    "SEC": ("005930.KS", "삼성전자"),
-    "HYNIX": ("000660.KS", "SK하이닉스"),
-}
 ESIGNAL_URL = "https://esignal.co.kr/kospi200-futures-night/"
+HISTORY_PERIOD = "12y"
 
 
 def _clean(df: pd.DataFrame) -> pd.DataFrame:
@@ -47,31 +45,37 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["Close"])
 
 
-def fetch_history(ticker: str, period: str = "5y") -> pd.DataFrame:
+def fetch_history(ticker: str, period: str = HISTORY_PERIOD) -> pd.DataFrame:
     return _clean(yf.Ticker(ticker).history(period=period, auto_adjust=True))
 
 
-def fetch_all(period: str = "5y") -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], dict[str, str]]:
-    """({대상키: 일봉}, {지표키: 일봉(DRAM·구성종목 포함)}, {키: 오류메시지})."""
-    errors: dict[str, str] = {}
-    targets: dict[str, pd.DataFrame] = {}
-    prices: dict[str, pd.DataFrame] = {}
+def fetch_all(period: str = HISTORY_PERIOD) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame], dict[str, str]]:
+    """({대상키: 일봉}, {지표키: 일봉(DRAM·SNDK 포함)}, {키: 오류메시지}). 병렬 수집."""
+    from concurrent.futures import ThreadPoolExecutor
+
     jobs = (
         [("t", k, t) for k, (t, _) in TARGETS.items()]
-        + [("p", k, t) for k, (t, _l, _d) in FEATURES.items()]
-        + [("p", "DRAM", DRAM_TICKER)]
-        + [("p", k, t) for k, (t, _) in DRAM_PEERS.items() if k not in FEATURES]
+        + [("p", k, t) for k, t in ASSETS.items()]
+        + [("p", "DRAM", DRAM_TICKER), ("p", "SNDK", "SNDK")]
     )
-    for kind, key, ticker in jobs:
+
+    def one(job):
+        kind, key, ticker = job
         try:
             df = fetch_history(ticker, period)
+            return kind, key, df, (None if len(df) else f"{ticker}: 데이터 없음")
         except Exception as exc:  # 네트워크/비공식 API 오류는 앱을 죽이지 않는다
-            errors[key] = f"{ticker}: {exc}"
-            continue
-        if df.empty:
-            errors[key] = f"{ticker}: 데이터 없음"
-        else:
-            (targets if kind == "t" else prices)[key] = df
+            return kind, key, None, f"{ticker}: {exc}"
+
+    targets: dict[str, pd.DataFrame] = {}
+    prices: dict[str, pd.DataFrame] = {}
+    errors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for kind, key, df, err in ex.map(one, jobs):
+            if err:
+                errors[key] = err
+            elif df is not None:
+                (targets if kind == "t" else prices)[key] = df
     return targets, prices, errors
 
 
