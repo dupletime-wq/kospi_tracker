@@ -10,6 +10,7 @@ import streamlit as st
 
 from src import features as F
 from src import models as M
+from src import perp
 from src import pipeline as P
 from src.data_sources import DRAM_PEERS, TARGETS, fetch_all, fetch_night_futures
 
@@ -84,6 +85,14 @@ def run_all(cfg: P.Config, sig: tuple, _targets, _prices, _pure):
     return dict(zip(keys, res))
 
 
+@st.cache_data(ttl=120, show_spinner="삼성전자·SK하이닉스 24시간 선물 확인 중…")
+def load_correction(sig: tuple, models: tuple, _res, _targets):
+    """실패(PerpUnavailable)는 캐시되지 않는다."""
+    mm = dict(models)
+    base = {k: _res[k].bt[["date", "y", mm[k]]].rename(columns={mm[k]: "pred"}) for k in _res}
+    return perp.build_correction(base, _targets)
+
+
 @st.cache_data(ttl=1800, show_spinner="feature ablation 실행 중…")
 def run_ablation(cfg: P.Config, tkey: str, sig: tuple, _targets, _prices, _pure):
     return P.ablation(tkey, _targets, _prices, _pure, cfg, "ridge")
@@ -149,7 +158,11 @@ with st.sidebar:
                                      help="0이면 가중 없음. 변동성 레짐이 바뀌어 최근을 더 중시하면 소폭 개선됩니다.")
         test_rows = st.slider("워크포워드 검증 기간(거래일)", 250, 750, 500, 50)
     st.divider()
-    st.markdown("**KOSPI 야간선물**")
+    st.markdown("**24시간 선물 보정**")
+    use_perp = st.checkbox("삼성전자·SK하이닉스 선물로 보정", value=True,
+                           help="거래소(Gate→Bitget→OKX)의 24시간 삼성전자·SK하이닉스 선물 가격으로 한국 마감 후 움직임을 반영합니다. "
+                                "표본외 검증에서 개선이 확인될 때만 적용되며, 수집 실패 시 모델 단독으로 동작합니다.")
+    st.markdown("**KOSPI 야간선물 (수동)**")
     auto = load_night()
     if auto:
         st.success(f"자동 수집: {auto.change_pct:+.2f}% ({auto.source})")
@@ -182,15 +195,39 @@ if res.get("KOSPI") is None:
 res = {k: v for k, v in res.items() if v is not None}
 chosen = {k: (P.best_model(ta) if model_sel == "auto" else model_sel) for k, ta in res.items()}
 
-# 야간선물 반영: KOSPI는 가중평균, 개별주는 KOSPI 갭 베타만큼 충격 전달
-k_model = res["KOSPI"].preds[chosen["KOSPI"]]
-k_final = P.blend_with_futures(k_model, fut_pct if use_fut else None, fut_w)
-shift = {"KOSPI": k_final - k_model}
+# 24시간 선물 보정 (표본외 검증에서 개선될 때만 적용, 실패하면 모델 단독)
+corr, corr_err = None, None
+if use_perp:
+    try:
+        corr = load_correction(sig, tuple(sorted(chosen.items())), res, targets)
+    except perp.PerpUnavailable as exc:
+        corr_err = str(exc)
+if corr_err:
+    st.sidebar.warning(f"24시간 선물 수집 실패 → 모델 단독 ({corr_err[:120]})")
+base_pred, stacked = {}, {}
+for k, ta in res.items():
+    mp = ta.preds[chosen[k]]
+    stk = corr.stacks.get(k) if corr else None
+    if stk is not None and stk.useful:
+        stacked[k] = stk
+        base_pred[k] = stk.predict(mp, corr.live[k])
+    else:
+        base_pred[k] = mp
+
+# 야간선물(수동) 반영: KOSPI는 가중평균, 개별주는 KOSPI 갭 베타만큼 충격 전달 (보정 후 예측 기준)
+k_base = base_pred["KOSPI"]
+k_final = P.blend_with_futures(k_base, fut_pct if use_fut else None, fut_w)
+final = {"KOSPI": k_final}
 for k in res:
     if k != "KOSPI":
-        shift[k] = P.gap_beta(targets[k], kospi) * (k_final - k_model)
-iv = {k: P.interval(ta, chosen[k], shift[k]) for k, ta in res.items()}
-final = {k: (iv[k]["pred"] if iv[k] else res[k].preds[chosen[k]] + shift[k]) for k in res}
+        final[k] = base_pred[k] + P.gap_beta(targets[k], kospi) * (k_final - k_base)
+iv = {}
+for k, ta in res.items():
+    if k in stacked:
+        lo, hi, pu = perp.normal_interval(final[k], stacked[k].sigma)
+        iv[k] = {"pred": final[k], "lo": lo, "hi": hi, "p_up": pu}
+    else:
+        iv[k] = P.interval(ta, chosen[k], final[k] - ta.preds[chosen[k]])
 target_date = res["KOSPI"].target_date
 
 # ---------------- 헤더 ----------------
@@ -199,6 +236,12 @@ pills += f'<span class="pill">모델 {M.MODEL_LABELS[chosen["KOSPI"]] if model_s
 pills += f'<span class="pill">야간선물 {fut_pct:+.2f}%</span>' if use_fut else '<span class="pill">야간선물 미반영</span>'
 if cfg.dram:
     pills += '<span class="pill">DRAM 순수 수급 반영</span>'
+if stacked:
+    pills += f'<span class="pill">24h 선물 보정 적용 · {(corr.asof + pd.Timedelta(hours=9)):%m/%d %H:%M} KST 기준</span>'
+elif use_perp:
+    pills += '<span class="pill">24h 선물 보정 미적용</span>'
+if pd.Timestamp.now(tz="UTC").tz_localize(None) >= perp.kr_open_ts(target_date):
+    pills += '<span class="pill">⚠️ 이미 개장한 날짜 — 실제 시가와 비교용</span>'
 st.markdown(
     f"""<div class="hero"><h1>📈 다음 거래일 시가 추정</h1>
 <p>한국장 마감 이후 해외 세션(EWY·반도체·삼성전자 GDR·DRAM 등)의 <b>세션내 움직임</b>을 분리해 KOSPI, 삼성전자, SK하이닉스의 시가 갭을 추정합니다.
@@ -214,6 +257,10 @@ def card(k: str) -> str:
     delta = f"{diff:+,.1f}p" if k == "KOSPI" else f"{diff:+,.0f}원"
     m = M.metrics(ta.bt, chosen[k])
     bar, rng, chip = "", "구간 계산 불가", ""
+    stk = stacked.get(k)
+    if stk:  # 보정 적용 시, 검증 지표도 보정 모델의 표본외 값으로
+        mm = stk.metrics
+        m = {"방향적중": mm["방향(보정)"], "MAE": mm["MAE(보정)"], "MAE 개선율": 1 - mm["MAE(보정)"] / mm["MAE(기준선)"]}
     if iv[k]:
         lo, hi = iv[k]["lo"], iv[k]["hi"]
         lim = max(abs(lo), abs(hi), 1e-9) * 1.15
@@ -222,20 +269,23 @@ def card(k: str) -> str:
         bar = (f'<div class="bar"><i style="left:{pos(lo):.1f}%;width:{pos(hi) - pos(lo):.1f}%;background:{color}"></i>'
                f'<em style="left:{pos(g) - 0.5:.1f}%;background:{color}"></em></div>')
         rng = f"80% 구간 <b>{lo:+.1f} ~ {hi:+.1f}%</b>"
-        chip = f'<span class="chip">상승확률 {iv[k]["p_up"]:.0%}</span>'
+        chip = f'<span class="chip">{"📡 " if stk else ""}상승확률 {iv[k]["p_up"]:.0%}</span>'
+    sub2 = (f'<div class="row"><span>모델 단독 <b>{ta.preds[chosen[k]]:+.2f}%</b> → 선물 반영 <b>{base_pred[k]:+.2f}%</b></span>'
+            f'<span>선물 {corr.live[k]:+.2f}%</span></div>') if stk else ""
     return f"""<div class="card"><div class="name"><span>{name}</span>{chip}</div>
 <div class="big {cls(g)}">{g:+.2f}%</div>
 <div class="sub">예상 시가 <b>{fmt_px(k, est)}</b> <span class="{cls(g)}">({delta})</span></div>
 {bar}
 <div class="row"><span>직전 종가 <b>{fmt_px(k, ta.last_close)}</b></span><span>{rng}</span></div>
-<div class="row"><span>검증 방향적중 <b>{m['방향적중']:.0%}</b></span><span>MAE <b>{m['MAE']:.2f}%p</b> (기준선 대비 −{m['MAE 개선율']:.0%})</span></div></div>"""
+{sub2}
+<div class="row"><span>{"선물 구간 표본외 " if stk else ""}방향적중 <b>{m['방향적중']:.0%}</b></span><span>MAE <b>{m['MAE']:.2f}%p</b> (기준선 대비 −{m['MAE 개선율']:.0%})</span></div></div>"""
 
 
 for c, k in zip(st.columns(len(res)), res):
     c.markdown(card(k), unsafe_allow_html=True)
 st.write("")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 요약·근거", "🏁 모델 비교", "🧪 Feature 분석", "🧠 DRAM 수급", "📖 방법론"])
+tab1, tab2, tab_perp, tab3, tab4, tab5 = st.tabs(["📊 요약·근거", "🏁 모델 비교", "🛰️ 선물 보정", "🧪 Feature 분석", "🧠 DRAM 수급", "📖 방법론"])
 
 
 def pick(label: str, key: str) -> str:
@@ -316,6 +366,55 @@ with tab2:
     st.plotly_chart(fig, width="stretch")
     if not full_zoo:
         st.info("사이드바에서 '전체 모델 비교'를 켜면 Lasso·ElasticNet·Random Forest·sklearn GBM도 같은 조건으로 비교합니다.")
+
+# ---------------- 선물 보정 ----------------
+with tab_perp:
+    if corr is None:
+        if use_perp:
+            st.warning(f"24시간 선물 데이터를 가져오지 못해 모델 단독 예측을 보여주고 있습니다. ({corr_err})")
+        else:
+            st.info("사이드바에서 '삼성전자·SK하이닉스 선물로 보정'을 켜면 사용됩니다.")
+    else:
+        st.markdown(
+            f"한국 전일 종가(15:30 KST)부터 **{(corr.asof + pd.Timedelta(hours=9)):%m/%d %H:%M} KST**({corr.elapsed / 60:.1f}시간 경과)까지 "
+            f"삼성전자·SK하이닉스 24시간 무기한 선물({corr.source.upper()})의 수익률을 모델 예측 위에 얹습니다. "
+            f"KOSPI는 두 선물의 평균을 대용 지표로 씁니다.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("삼성전자 선물", f"{corr.live['SEC']:+.2f}%")
+        c2.metric("SK하이닉스 선물", f"{corr.live['HYNIX']:+.2f}%")
+        c3.metric("KOSPI 대용(평균)", f"{corr.live['KOSPI']:+.2f}%")
+        rows = []
+        for k in res:
+            stk = corr.stacks.get(k)
+            if stk is None:
+                rows.append({"대상": TARGETS[k][1], "적용": "표본 부족"})
+                continue
+            mm = stk.metrics
+            rows.append({"대상": TARGETS[k][1], "적용": "✅ 적용" if stk.useful else "⛔ 검증상 개선 없음",
+                         "표본(일)": mm["n"], "절편": round(stk.coef[0], 2), "모델 계수": round(stk.coef[1], 2),
+                         "선물 계수": round(stk.coef[2], 2), "MAE 모델": round(mm["MAE(모델)"], 3),
+                         "MAE 보정(표본외)": round(mm["MAE(보정)"], 3), "개선": f"{mm['MAE 개선']:+.0%}",
+                         "재보정 대비": f"{mm['MAE 개선(재보정 대비)']:+.0%}",
+                         "방향 모델→보정": f"{mm['방향(모델)']:.0%}→{mm['방향(보정)']:.0%}",
+                         "상관 모델→보정": f"{mm['상관(모델)']:.2f}→{mm['상관(보정)']:.2f}"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption("보정 = 절편 + 모델 계수 × 모델 예측 + 선물 계수 × 선물 수익률 (선물 상장 이후 구간에서 회귀). "
+                   "표본외 성능은 과거만으로 학습해 다음 날을 맞히는 확장 윈도우로 계산합니다. '재보정 대비'는 선물 없이 모델 예측의 스케일만 고친 경우와의 비교로, "
+                   "둘 다 이길 때만 적용됩니다. 이르거나 정보가 약한 시각에는 자동으로 꺼집니다.")
+        k = pick("대상", "perp_who")
+        stk = corr.stacks.get(k)
+        if stk is not None:
+            f = stk.frame.dropna(subset=["oos"])
+            fig = go.Figure()
+            fig.add_bar(x=f["date"], y=f["y"], name="실제 갭", marker_color="#ced4da")
+            fig.add_scatter(x=f["date"], y=f["base"], name="모델 단독", mode="lines", line=dict(color=MUTED, width=1.5, dash="dot"))
+            fig.add_scatter(x=f["date"], y=f["oos"], name="선물 보정(표본외)", mode="lines", line=dict(color=ACCENT, width=2))
+            fig.update_layout(yaxis_title="시가 갭 (%)", height=360, margin=dict(l=10, r=10, t=10, b=10),
+                              legend=dict(orientation="h"), plot_bgcolor="rgba(0,0,0,0)", hovermode="x unified")
+            st.plotly_chart(fig, width="stretch")
+        st.markdown('<div class="note">⚠️ 이 선물은 2026-06 상장으로 이력이 약 4개월(약 80거래일)이고 변동성이 큰 한 구간입니다. '
+                    '거래소·상품 중단, 주말 유동성 부족, 현물과의 괴리 위험이 있고, 모델이 학습한 정보가 아니라 시장 가격을 읽는 보정입니다. '
+                    '표본이 쌓이면 계수를 자동으로 다시 맞춥니다.</div>', unsafe_allow_html=True)
 
 # ---------------- Feature 분석 ----------------
 with tab3:

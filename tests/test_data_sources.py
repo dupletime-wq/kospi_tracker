@@ -82,3 +82,13 @@ def test_fetch_history_retries_then_succeeds(monkeypatch):
     with pytest.raises(RuntimeError):
         monkeypatch.setattr(ds.yf, "Ticker", lambda t: (_ for _ in ()).throw(RuntimeError("down")))
         ds.fetch_history("X")
+
+
+def test_drop_incomplete_kr_during_session_only():
+    d = _df("2026-09-28", 5)  # 9/28~10/2 (금)
+    # 금요일 11:00 KST = 02:00 UTC: 오늘 행은 미완성 → 제거
+    assert len(ds.drop_incomplete_kr(d, pd.Timestamp("2026-10-02 02:00"))) == 4
+    # 금요일 16:00 KST = 07:00 UTC: 마감 후 → 유지
+    assert len(ds.drop_incomplete_kr(d, pd.Timestamp("2026-10-02 07:00"))) == 5
+    # 토요일: 마지막 행은 금요일 → 유지
+    assert len(ds.drop_incomplete_kr(d, pd.Timestamp("2026-10-03 02:00"))) == 5

@@ -108,6 +108,15 @@ def merge_history(snap: pd.DataFrame | None, live: pd.DataFrame | None) -> pd.Da
     return pd.concat([old, live])
 
 
+def drop_incomplete_kr(df: pd.DataFrame, now_utc: pd.Timestamp | None = None) -> pd.DataFrame:
+    """한국 장중(09:00~15:40 KST)에 받은 일봉의 오늘 행은 미완성이므로 버린다."""
+    now = now_utc or pd.Timestamp.now(tz="UTC").tz_localize(None)
+    kst = now + pd.Timedelta(hours=9)
+    if len(df) and df.index[-1].normalize() == kst.normalize() and kst.weekday() < 5 and kst.hour * 60 + kst.minute < 15 * 60 + 40:
+        return df.iloc[:-1]
+    return df
+
+
 @dataclass
 class Market:
     targets: dict[str, pd.DataFrame]
@@ -148,6 +157,8 @@ def fetch_all(period: str = HISTORY_PERIOD, workers: int = 4) -> Market:
                 errors[key] = err
             if df is None or df.empty:
                 continue
+            if kind == "t":
+                df = drop_incomplete_kr(df)
             if fell_back:
                 stale[key] = f"{df.index[-1]:%Y-%m-%d}"
             (targets if kind == "t" else prices)[key] = df
